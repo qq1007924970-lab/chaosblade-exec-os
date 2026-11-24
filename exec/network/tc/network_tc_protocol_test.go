@@ -85,10 +85,23 @@ func TestMultiProtocolInstallation(t *testing.T) {
 	}
 }
 
-func TestRejectICMPAndPortsBeforeInjection(t *testing.T) {
-	resp := startNet(context.Background(), "eth0", "netem loss 10%", "", "53", "", "", "", false, false, "test", "udp,icmp", nil)
-	if resp.Success {
-		t.Fatal("accepted ICMP with a port match")
+func TestICMPFiltersOmitPorts(t *testing.T) {
+	for _, protocols := range [][]string{{"1"}, {"6", "1"}} {
+		ch := &protocolTestChannel{}
+		executeTargetPortAndIpWithExclude(context.Background(), ch, "eth0", "netem loss 100%", [][]int{{42, 42}}, [][]int{{53, 53}},
+			[]string{"match ip dst 192.0.2.1"}, [][]int{{80, 80}}, []string{"match ip dst 192.0.2.2"}, protocols)
+		seen := 0
+		for _, rule := range strings.Split(ch.commands[0], "&&") {
+			if strings.Contains(rule, "match ip protocol 1 0xff") {
+				seen++
+				if strings.Contains(rule, "port ") || !strings.Contains(rule, "match ip dst 192.0.2.") {
+					t.Fatalf("invalid ICMP rule: %s", rule)
+				}
+			}
+		}
+		if seen != 2 {
+			t.Fatalf("got %d ICMP rules, want one include and one exclude", seen)
+		}
 	}
 }
 
@@ -100,5 +113,18 @@ func TestMultiProtocolOwner(t *testing.T) {
 	}
 	if !hasOwnerMarker(dump, uid) || hasOwnerMarker(dump, "another") || hasOwnerMarker(strings.ReplaceAll(dump, "7aa::800", "800::800"), uid) {
 		t.Fatal("expected only the complete marker in the private table to match")
+	}
+}
+
+func TestRootQdiscIgnoresIngressAndChildQueues(t *testing.T) {
+	for output, want := range map[string]string{
+		"qdisc noqueue 0: root refcnt 2":                                    "0:",
+		"qdisc netem 40: parent 1:4\nqdisc prio 1: root refcnt 2":           "1:",
+		"qdisc prio 71: root refcnt 2\nqdisc clsact ffff: parent ffff:fff1": "71:",
+		"qdisc netem 40: parent 1:4":                                        "",
+	} {
+		if _, handle := rootQdisc(output); handle != want {
+			t.Errorf("rootQdisc(%q) handle = %q, want %q", output, handle, want)
+		}
 	}
 }
