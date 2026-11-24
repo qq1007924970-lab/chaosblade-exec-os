@@ -737,12 +737,21 @@ func checkRootBeforeCreate(ctx context.Context, cl spec.Channel, device, uid str
 	if !ok {
 		return spec.ReturnFail(spec.UnexpectedStatus, "cannot read root qdisc on "+device)
 	}
-	_, handle := rootQdisc(output)
+	kind, handle := rootQdisc(output)
 	if handle == "" || handle == "0:" {
 		// The exclusive qdisc add is still required after the preflight.
 		return spec.ReturnSuccess(nil)
 	}
 	resp := spec.ReturnFail(spec.UnexpectedStatus, "root qdisc already in use on "+device)
+	if kind == "prio" && handle == "1:" {
+		// A repeated create with the same UID may find its own live fault.
+		// In that case the caller must retain the target for recovery.
+		filters := readOwnerFilters(ctx, cl, device)
+		output, ok := filters.Result.(string)
+		if !filters.Success || !ok || hasOwnerMarker(output, uid) {
+			return resp
+		}
+	}
 	// Only a create rejected before mutation supplies this per-dispatch receipt.
 	resp.Result = map[string]string{"networkCreateSkippedUID": uid}
 	return resp
@@ -801,7 +810,7 @@ func checkLegacyNetworkRoot(ctx context.Context, cl spec.Channel, device string)
 		if !strings.HasPrefix(line, "qdisc prio 1: root ") {
 			continue
 		}
-		f := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref %d", device, ownerMarkerPriority))
+		f := readOwnerFilters(ctx, cl, device)
 		if !f.Success {
 			return f
 		}
@@ -813,8 +822,12 @@ func checkLegacyNetworkRoot(ctx context.Context, cl spec.Channel, device string)
 	return spec.ReturnSuccess(nil)
 }
 
+func readOwnerFilters(ctx context.Context, cl spec.Channel, device string) *spec.Response {
+	return cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref %d", device, ownerMarkerPriority))
+}
+
 func checkOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
-	filters := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref %d", device, ownerMarkerPriority))
+	filters := readOwnerFilters(ctx, cl, device)
 	if !filters.Success {
 		return filters
 	}

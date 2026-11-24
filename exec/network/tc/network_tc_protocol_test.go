@@ -46,6 +46,7 @@ func TestProtocolNumbers(t *testing.T) {
 
 type protocolTestChannel struct {
 	spec.Channel
+	root     string
 	filters  string
 	commands []string
 }
@@ -54,6 +55,9 @@ func (ch *protocolTestChannel) Run(ctx context.Context, cmd, args string) *spec.
 	ch.commands = append(ch.commands, args)
 	switch {
 	case strings.HasPrefix(args, "qdisc show"):
+		if ch.root != "" {
+			return spec.ReturnSuccess(ch.root)
+		}
 		return spec.ReturnSuccess("qdisc netem 40: parent 1:4 limit 1000 delay 100ms")
 	case strings.HasPrefix(args, "filter show"):
 		return spec.ReturnSuccess(ch.filters)
@@ -126,5 +130,17 @@ func TestRootQdiscIgnoresIngressAndChildQueues(t *testing.T) {
 		if _, handle := rootQdisc(output); handle != want {
 			t.Errorf("rootQdisc(%q) handle = %q, want %q", output, handle, want)
 		}
+	}
+}
+
+func TestRepeatedCreatePreservesOwnedTargetForRecovery(t *testing.T) {
+	const uid = "aabbccddeeff0011"
+	ch := &protocolTestChannel{root: "qdisc prio 1: root", filters: "filter fh 7aa::800\n"}
+	for i, key := range ownerKeys(uid) {
+		ch.filters += fmt.Sprintf("match %s/ffffffff at %d\n", key, i*4)
+	}
+	resp := checkRootBeforeCreate(context.Background(), ch, "eth0", uid)
+	if resp.Success || resp.Result != nil {
+		t.Fatalf("existing owner must remain recoverable, got %+v", resp)
 	}
 }
