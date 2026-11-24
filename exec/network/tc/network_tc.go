@@ -259,6 +259,11 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 		}
 	}
 
+	guard, lockErr := lockNetns(ctx)
+	if lockErr != nil {
+		return spec.ReturnFail(spec.UnexpectedStatus, lockErr.Error())
+	}
+	defer guard.Close()
 	// check device txqueuelen size, if the size is zero, then set the value to 1000
 	response := preHandleTxqueue(ctx, netInterface, cl)
 	if !response.Success {
@@ -275,6 +280,9 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	}
 	// A multi-protocol experiment must acquire its own root, even with --force.
 	if force && !multi {
+		if guard := checkLegacyNetworkRoot(ctx, cl, netInterface); !guard.Success {
+			return guard
+		}
 		stopNet(ctx, netInterface, cl)
 	}
 	// Only interface flag
@@ -291,7 +299,7 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	}
 
 	response = addQdiscForDL(cl, ctx, netInterface)
-	if multi && !response.Success {
+	if !response.Success {
 		return response
 	}
 
@@ -698,7 +706,15 @@ func stopNetworkExperiment(ctx context.Context, device, uid, protocol string, cl
 	if err != nil {
 		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, err.Error())
 	}
+	guard, lockErr := lockNetns(ctx)
+	if lockErr != nil {
+		return spec.ReturnFail(spec.UnexpectedStatus, lockErr.Error())
+	}
+	defer guard.Close()
 	if len(protocols) == 1 {
+		if guard := checkLegacyNetworkRoot(ctx, cl, device); !guard.Success {
+			return guard
+		}
 		return stopNet(ctx, device, cl)
 	}
 	qdisc := cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
@@ -716,6 +732,32 @@ func stopNetworkExperiment(ctx context.Context, device, uid, protocol string, cl
 		return verified
 	}
 	return cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc del dev %s root handle 1:", device))
+}
+
+// Protect a marked experiment from a legacy single-protocol destroy or --force.
+func checkLegacyNetworkRoot(ctx context.Context, cl spec.Channel, device string) *spec.Response {
+	q := cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !q.Success {
+		return q
+	}
+	out, ok := q.Result.(string)
+	if !ok {
+		return spec.ReturnFail(spec.UnexpectedStatus, "cannot read root qdisc on "+device)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "qdisc prio 1: root ") {
+			continue
+		}
+		f := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref 32000", device))
+		if !f.Success {
+			return f
+		}
+		filters, ok := f.Result.(string)
+		if !ok || strings.Contains(filters, "fh 7aa:") {
+			return spec.ReturnFail(spec.UnexpectedStatus, "refusing to remove a reserved network root on "+device)
+		}
+	}
+	return spec.ReturnSuccess(nil)
 }
 
 func checkOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {

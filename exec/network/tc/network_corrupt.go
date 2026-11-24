@@ -118,7 +118,7 @@ func (ce *NetworkCorruptExecutor) start(netInterface, localPort, remotePort, exc
 }
 
 func (ce *NetworkCorruptExecutor) stop(netInterface string, ctx context.Context) *spec.Response {
-	return stopNet(ctx, netInterface, ce.channel)
+	return stopNetworkExperiment(ctx, netInterface, "", "", ce.channel)
 }
 
 func (ce *NetworkCorruptExecutor) SetChannel(channel spec.Channel) {
