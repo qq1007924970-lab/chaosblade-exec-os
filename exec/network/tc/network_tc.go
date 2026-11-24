@@ -651,6 +651,11 @@ func addQdiscForDL(channel spec.Channel, ctx context.Context, netInterface strin
 	return channel.Run(ctx, tcCommand(), fmt.Sprintf(`qdisc add dev %s root handle 1: prio bands 4`, netInterface))
 }
 
+const (
+	ownerMarkerPriority = 32000
+	ownerMarkerTable    = "7aa:"
+)
+
 // The table is not linked from any classifier. Its keys identify the owner
 // without selecting or redirecting packets. The kernel removes it with the root.
 func ownerKeys(uid string) []string {
@@ -663,8 +668,8 @@ func ownerKeys(uid string) []string {
 }
 
 func installOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
-	base := fmt.Sprintf("filter add dev %s parent 1: protocol ip pref 32000", device)
-	args := base + " handle 7aa: u32 divisor 1 && tc " + base + " u32 ht 7aa:"
+	base := fmt.Sprintf("filter add dev %s parent 1: protocol ip pref %d", device, ownerMarkerPriority)
+	args := fmt.Sprintf("%s handle %s u32 divisor 1 && tc %s u32 ht %s", base, ownerMarkerTable, base, ownerMarkerTable)
 	for i, key := range ownerKeys(uid) {
 		args += fmt.Sprintf(" match u32 0x%s 0xffffffff at %d", key, 4*i)
 	}
@@ -687,7 +692,7 @@ func hasOwnerMarker(output, uid string) bool {
 			inMarker = false
 			matched = 0
 			for i, field := range fields {
-				if field == "fh" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], "7aa::") {
+				if field == "fh" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], ownerMarkerTable+":") {
 					inMarker = true
 				}
 			}
@@ -748,12 +753,12 @@ func checkLegacyNetworkRoot(ctx context.Context, cl spec.Channel, device string)
 		if !strings.HasPrefix(line, "qdisc prio 1: root ") {
 			continue
 		}
-		f := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref 32000", device))
+		f := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref %d", device, ownerMarkerPriority))
 		if !f.Success {
 			return f
 		}
 		filters, ok := f.Result.(string)
-		if !ok || strings.Contains(filters, "fh 7aa:") {
+		if !ok || strings.Contains(filters, "fh "+ownerMarkerTable) {
 			return spec.ReturnFail(spec.UnexpectedStatus, "refusing to remove a reserved network root on "+device)
 		}
 	}
@@ -761,7 +766,7 @@ func checkLegacyNetworkRoot(ctx context.Context, cl spec.Channel, device string)
 }
 
 func checkOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
-	filters := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref 32000", device))
+	filters := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref %d", device, ownerMarkerPriority))
 	if !filters.Success {
 		return filters
 	}

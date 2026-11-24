@@ -18,11 +18,12 @@ package tc
 
 import (
 	"context"
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"golang.org/x/sys/unix"
 	"os"
 	"strconv"
 	"testing"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"golang.org/x/sys/unix"
 )
 
 // A target opened through a PID and through /proc/self must contend on the
