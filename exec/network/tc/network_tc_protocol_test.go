@@ -18,6 +18,7 @@ package tc
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -85,8 +86,19 @@ func TestMultiProtocolInstallation(t *testing.T) {
 }
 
 func TestRejectICMPAndPortsBeforeInjection(t *testing.T) {
-	resp := startNet(context.Background(), "eth0", "netem loss 10%", "", "53", "", "", "", false, false, "udp,icmp", nil)
+	resp := startNet(context.Background(), "eth0", "netem loss 10%", "", "53", "", "", "", false, false, "test", "udp,icmp", nil)
 	if resp.Success {
 		t.Fatal("accepted ICMP with a port match")
+	}
+}
+
+func TestMultiProtocolOwner(t *testing.T) {
+	const uid = "aabbccddeeff0011"
+	dump := "filter protocol ip u32 chain 0 fh 7aa::800 order 2048 key ht 7aa bkt 0 not_in_hw\n"
+	for i, key := range ownerKeys(uid) {
+		dump += fmt.Sprintf("  match %s/ffffffff at %d\n", key, 4*i)
+	}
+	if !hasOwnerMarker(dump, uid) || hasOwnerMarker(dump, "another") || hasOwnerMarker(strings.ReplaceAll(dump, "7aa::800", "800::800"), uid) {
+		t.Fatal("expected only the complete marker in the private table to match")
 	}
 }

@@ -104,7 +104,7 @@ func (ce *NetworkReorderExecutor) Exec(uid string, ctx context.Context, model *s
 		return spec.ResponseFailWithFlags(spec.ParameterLess, "interface")
 	}
 	if _, ok := spec.IsDestroy(ctx); ok {
-		return ce.stop(netInterface, ctx)
+		return stopNetworkExperiment(ctx, netInterface, uid, model.ActionFlags["protocol"], ce.channel)
 	} else {
 		percent := model.ActionFlags["percent"]
 		if percent == "" {
@@ -129,12 +129,12 @@ func (ce *NetworkReorderExecutor) Exec(uid string, ctx context.Context, model *s
 		protocol := model.ActionFlags["protocol"]
 		force := model.ActionFlags["force"] == "true"
 		return ce.start(netInterface, localPort, remotePort, excludePort, destIp, excludeIp, percent,
-			ignorePeerPort, gap, time, correlation, force, protocol, ctx)
+			ignorePeerPort, gap, time, correlation, force, uid, protocol, ctx)
 	}
 }
 
 func (ce *NetworkReorderExecutor) start(netInterface, localPort, remotePort, excludePort, destIp, excludeIp, percent string,
-	ignorePeerPort bool, gap, time, correlation string, force bool, protocol string, ctx context.Context,
+	ignorePeerPort bool, gap, time, correlation string, force bool, uid, protocol string, ctx context.Context,
 ) *spec.Response {
 	classRule := fmt.Sprintf("netem reorder %s%% %s%%", percent, correlation)
 	if gap != "" {
@@ -142,11 +142,7 @@ func (ce *NetworkReorderExecutor) start(netInterface, localPort, remotePort, exc
 	}
 	classRule = fmt.Sprintf("%s delay %sms", classRule, time)
 
-	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, protocol, ce.channel)
-}
-
-func (ce *NetworkReorderExecutor) stop(netInterface string, ctx context.Context) *spec.Response {
-	return stopNet(ctx, netInterface, ce.channel)
+	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, uid, protocol, ce.channel)
 }
 
 func (ce *NetworkReorderExecutor) SetChannel(channel spec.Channel) {

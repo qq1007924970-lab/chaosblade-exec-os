@@ -114,7 +114,7 @@ func (de *NetworkDuplicateExecutor) start(netInterface, localPort, remotePort, e
 ) *spec.Response {
 	classRule := fmt.Sprintf("netem duplicate %s%%", percent)
 
-	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, protocol, de.channel)
+	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, "", protocol, de.channel)
 }
 
 func (de *NetworkDuplicateExecutor) stop(netInterface string, ctx context.Context) *spec.Response {

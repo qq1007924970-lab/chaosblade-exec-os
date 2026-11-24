@@ -18,6 +18,7 @@ package tc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
@@ -194,7 +195,7 @@ var commFlags = []spec.ExpFlagSpec{
 	},
 	&spec.ExpFlag{
 		Name: "protocol",
-		Desc: "Match tcp, udp or icmp; separate multiple protocols with commas (e.g. tcp,udp).",
+		Desc: "Match tcp, udp or icmp. For delay, loss and reorder, separate multiple protocols with commas (e.g. tcp,udp).",
 	},
 	&spec.ExpFlag{
 		Name:   "force",
@@ -226,12 +227,15 @@ func protocolNumbers(value string) ([]string, error) {
 	return protocols, nil
 }
 
-func startNet(ctx context.Context, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp string, force, ignorePeerPorts bool, protocol string, cl spec.Channel) *spec.Response {
+func startNet(ctx context.Context, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp string, force, ignorePeerPorts bool, uid, protocol string, cl spec.Channel) *spec.Response {
 	protocols, err := protocolNumbers(protocol)
 	if err != nil {
 		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, err.Error())
 	}
 	multi := len(protocols) > 1
+	if multi && uid == "" {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, "protocol lists require a delay, loss or reorder experiment with a UID")
+	}
 	if multi && slices.Contains(protocols, "1") && (localPort != "" || remotePort != "" || excludePort != "") {
 		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, "ICMP in a protocol list cannot be combined with port filters")
 	}
@@ -289,6 +293,16 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	response = addQdiscForDL(cl, ctx, netInterface)
 	if multi && !response.Success {
 		return response
+	}
+
+	if multi {
+		marker := installOwnerMarker(ctx, cl, netInterface, uid)
+		if !marker.Success {
+			if rollback := stopNet(ctx, netInterface, cl); !rollback.Success {
+				return spec.ReturnFail(spec.UnexpectedStatus, fmt.Sprintf("%s (rollback failed: %s)", marker.Err, rollback.Err))
+			}
+			return marker
+		}
 	}
 
 	// only contains excludePort or excludeIP
@@ -627,6 +641,93 @@ func buildTargetFilterPortAndIp(localPortRanges, remotePortRanges [][]int, destI
 func addQdiscForDL(channel spec.Channel, ctx context.Context, netInterface string) *spec.Response {
 	// add tc filter for delay specify port
 	return channel.Run(ctx, tcCommand(), fmt.Sprintf(`qdisc add dev %s root handle 1: prio bands 4`, netInterface))
+}
+
+// The table is not linked from any classifier. Its keys identify the owner
+// without selecting or redirecting packets. The kernel removes it with the root.
+func ownerKeys(uid string) []string {
+	sum := sha256.Sum256([]byte(uid))
+	keys := make([]string, 4)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("%x", sum[i*4:i*4+4])
+	}
+	return keys
+}
+
+func installOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
+	base := fmt.Sprintf("filter add dev %s parent 1: protocol ip pref 32000", device)
+	args := base + " handle 7aa: u32 divisor 1 && tc " + base + " u32 ht 7aa:"
+	for i, key := range ownerKeys(uid) {
+		args += fmt.Sprintf(" match u32 0x%s 0xffffffff at %d", key, 4*i)
+	}
+	if resp := cl.Run(ctx, tcCommand(), args); !resp.Success {
+		return resp
+	}
+	return checkOwnerMarker(ctx, cl, device, uid)
+}
+
+func hasOwnerMarker(output, uid string) bool {
+	want := ownerKeys(uid)
+	matched := 0
+	inMarker := false
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "filter" {
+			inMarker = false
+			matched = 0
+			for i, field := range fields {
+				if field == "fh" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], "7aa::") {
+					inMarker = true
+				}
+			}
+		} else if inMarker && strings.Join(fields, " ") == fmt.Sprintf("match %s/ffffffff at %d", want[matched], 4*matched) {
+			matched++
+			if matched == len(want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func stopNetworkExperiment(ctx context.Context, device, uid, protocol string, cl spec.Channel) *spec.Response {
+	protocols, err := protocolNumbers(protocol)
+	if err != nil {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, err.Error())
+	}
+	if len(protocols) == 1 {
+		return stopNet(ctx, device, cl)
+	}
+	qdisc := cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !qdisc.Success {
+		return qdisc
+	}
+	output, _ := qdisc.Result.(string)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == "qdisc" && fields[2] == "0:" && fields[3] == "root" {
+			return spec.ReturnSuccess("experiment root is absent")
+		}
+	}
+	if verified := checkOwnerMarker(ctx, cl, device, uid); !verified.Success {
+		return verified
+	}
+	return cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc del dev %s root handle 1:", device))
+}
+
+func checkOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
+	filters := cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref 32000", device))
+	if !filters.Success {
+		return filters
+	}
+	output, _ := filters.Result.(string)
+	if !hasOwnerMarker(output, uid) {
+		return spec.ReturnFail(spec.UnexpectedStatus, "cannot confirm ownership of the root qdisc on "+device)
+	}
+	return spec.ReturnSuccess(nil)
 }
 
 // stopNet
