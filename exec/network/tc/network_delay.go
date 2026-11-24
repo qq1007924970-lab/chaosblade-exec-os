@@ -100,7 +100,7 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *spe
 		return spec.ResponseFailWithFlags(spec.ParameterLess, "interface")
 	}
 	if _, ok := spec.IsDestroy(ctx); ok {
-		return de.stop(netInterface, ctx)
+		return stopNetworkExperiment(ctx, netInterface, uid, model.ActionFlags["protocol"], de.channel)
 	} else {
 		time := model.ActionFlags["time"]
 		if time == "" {
@@ -119,19 +119,15 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *spe
 		ignorePeerPort := model.ActionFlags["ignore-peer-port"] == "true"
 		protocol := model.ActionFlags["protocol"]
 		force := model.ActionFlags["force"] == "true"
-		return de.start(localPort, remotePort, excludePort, destIp, excludeIp, time, offset, netInterface, ignorePeerPort, force, protocol, ctx)
+		return de.start(localPort, remotePort, excludePort, destIp, excludeIp, time, offset, netInterface, ignorePeerPort, force, uid, protocol, ctx)
 	}
 }
 
 func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, destIp, excludeIp, time, offset, netInterface string,
-	ignorePeerPort, force bool, protocol string, ctx context.Context,
+	ignorePeerPort, force bool, uid, protocol string, ctx context.Context,
 ) *spec.Response {
 	classRule := fmt.Sprintf("netem delay %sms %sms", time, offset)
-	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, protocol, de.channel)
-}
-
-func (de *NetworkDelayExecutor) stop(netInterface string, ctx context.Context) *spec.Response {
-	return stopNet(ctx, netInterface, de.channel)
+	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, uid, protocol, de.channel)
 }
 
 func (de *NetworkDelayExecutor) SetChannel(channel spec.Channel) {

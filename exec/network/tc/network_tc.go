@@ -18,12 +18,14 @@ package tc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
 	"math/bits"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -193,7 +195,7 @@ var commFlags = []spec.ExpFlagSpec{
 	},
 	&spec.ExpFlag{
 		Name: "protocol",
-		Desc: "specify protocol for example tcp udp icmp ",
+		Desc: "Match tcp, udp or icmp. For delay, loss and reorder, separate multiple protocols with commas (e.g. tcp,udp). Port filters apply to TCP and UDP only; IP filters also apply to ICMP.",
 	},
 	&spec.ExpFlag{
 		Name:   "force",
@@ -204,21 +206,38 @@ var commFlags = []spec.ExpFlagSpec{
 
 const delimiter = ","
 
-func startNet(ctx context.Context, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp string, force, ignorePeerPorts bool, protocol string, cl spec.Channel) *spec.Response {
-	if protocol != "" {
-		switch protocol {
-		case "tcp":
-			protocol = "6"
-		case "udp":
-			protocol = "17"
-		case "icmp":
-			protocol = "1"
-		default:
-			return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, "unsupport protocol")
+// An empty flag retains the original unrestricted protocol match.
+func protocolNumbers(value string) ([]string, error) {
+	if value == "" {
+		return []string{""}, nil
+	}
+	ids := map[string]string{"tcp": "6", "udp": "17", "icmp": "1"}
+	seen := make(map[string]bool)
+	var protocols []string
+	for _, item := range strings.Split(value, ",") {
+		id, ok := ids[strings.TrimSpace(item)]
+		if !ok {
+			return nil, fmt.Errorf("unknown network protocol %q", item)
+		}
+		if !seen[id] {
+			seen[id] = true
+			protocols = append(protocols, id)
 		}
 	}
+	return protocols, nil
+}
+
+func startNet(ctx context.Context, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp string, force, ignorePeerPorts bool, uid, protocol string, cl spec.Channel) *spec.Response {
+	protocols, err := protocolNumbers(protocol)
+	if err != nil {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, err.Error())
+	}
+	multi := len(protocols) > 1
+	if multi && uid == "" {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, "protocol lists require a delay, loss or reorder experiment with a UID")
+	}
+
 	var localPortRanges, remotePortRanges, excludePortRanges [][]int
-	var err error
 	if localPort != "" {
 		localPortRanges, err = parseIntegerListToPortRanges("local-port", localPort)
 		if err != nil {
@@ -232,12 +251,27 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 		}
 	}
 	if excludePort != "" {
-		excludePortRanges, err = getExcludePortRanges(ctx, excludePort, ignorePeerPorts, cl)
+		if len(protocols) == 1 && protocols[0] == "1" {
+			// Validate the input without resolving peer ports for ICMP.
+			_, err = parseIntegerListToPortRanges("exclude-port", excludePort)
+		} else {
+			excludePortRanges, err = getExcludePortRanges(ctx, excludePort, ignorePeerPorts, cl)
+		}
 		if err != nil {
 			return spec.ResponseFailWithFlags(spec.ParameterIllegal, "exclude-port", excludePort, err)
 		}
 	}
 
+	guard, lockErr := lockNetns(ctx)
+	if lockErr != nil {
+		return spec.ReturnFail(spec.UnexpectedStatus, lockErr.Error())
+	}
+	defer guard.Close()
+	if multi {
+		if checked := checkRootBeforeCreate(ctx, cl, netInterface, uid); !checked.Success {
+			return checked
+		}
+	}
 	// check device txqueuelen size, if the size is zero, then set the value to 1000
 	response := preHandleTxqueue(ctx, netInterface, cl)
 	if !response.Success {
@@ -252,7 +286,11 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 			excludeIp = channelIps
 		}
 	}
-	if force {
+	// A multi-protocol experiment must acquire its own root, even with --force.
+	if force && !multi {
+		if guard := checkLegacyNetworkRoot(ctx, cl, netInterface); !guard.Success {
+			return guard
+		}
 		stopNet(ctx, netInterface, cl)
 	}
 	// Only interface flag
@@ -269,6 +307,19 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	}
 
 	response = addQdiscForDL(cl, ctx, netInterface)
+	if !response.Success {
+		return response
+	}
+
+	if multi {
+		marker := installOwnerMarker(ctx, cl, netInterface, uid)
+		if !marker.Success {
+			if rollback := stopNet(ctx, netInterface, cl); !rollback.Success {
+				return spec.ReturnFail(spec.UnexpectedStatus, fmt.Sprintf("%s (rollback failed: %s)", marker.Err, rollback.Err))
+			}
+			return marker
+		}
+	}
 
 	// only contains excludePort or excludeIP
 	if localPort == "" && remotePort == "" && destIp == "" && protocol == "" {
@@ -290,7 +341,7 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	excludeIpRules := getExcludeIpRules(excludeIp)
 	// local port or remote port
 	return executeTargetPortAndIpWithExclude(ctx, cl, netInterface, classRule, localPortRanges, remotePortRanges, destIpRules,
-		excludePortRanges, excludeIpRules, protocol)
+		excludePortRanges, excludeIpRules, protocols)
 }
 
 func getExcludePortRanges(ctx context.Context, excludePort string, ignorePeerPorts bool, cl spec.Channel) ([][]int, error) {
@@ -432,20 +483,87 @@ func getExcludeIpRules(excludeIp string) []string {
 
 // executeTargetPortAndIpWithExclude creates class rule in 1:4 queue and add filter to the queue
 func executeTargetPortAndIpWithExclude(ctx context.Context, channel spec.Channel,
-	netInterface, classRule string, localPortRanges, remotePortRanges [][]int, destIpRules []string, excludePorts [][]int, excludeIpRules []string, protocol string,
+	netInterface, classRule string, localPortRanges, remotePortRanges [][]int, destIpRules []string, excludePorts [][]int, excludeIpRules []string, protocols []string,
 ) *spec.Response {
 	args := fmt.Sprintf(`qdisc add dev %s parent 1:4 handle 40: %s`, netInterface, classRule)
-	args = buildTargetFilterPortAndIp(localPortRanges, remotePortRanges, destIpRules, excludePorts, excludeIpRules, args, netInterface, protocol)
-	response := channel.Run(ctx, tcCommand(), args)
-	if !response.Success {
-		stopNet(ctx, netInterface, channel)
-		return response
+	for _, protocol := range protocols {
+		targets := destIpRules
+		local, remote, excluded := localPortRanges, remotePortRanges, excludePorts
+		if protocol == "1" {
+			// ICMP has no transport ports. IP selectors still apply.
+			local, remote, excluded = nil, nil, nil
+		}
+		if (len(protocols) > 1 || protocol == "1") && len(destIpRules) == 0 && len(local) == 0 && len(remote) == 0 && (len(excludeIpRules) > 0 || len(excluded) > 0) {
+			targets = []string{"match ip dst 0.0.0.0/0"}
+		}
+		args = buildTargetFilterPortAndIp(local, remote, targets, excluded, excludeIpRules, args, netInterface, protocol)
 	}
-	if verifyResp := verifyNetemApplied(ctx, channel, netInterface, classRule); !verifyResp.Success {
-		stopNet(ctx, netInterface, channel)
-		return verifyResp
+	response := channel.Run(ctx, tcCommand(), args)
+	if response.Success {
+		var verified *spec.Response
+		if len(protocols) == 1 {
+			verified = verifyNetemApplied(ctx, channel, netInterface, classRule)
+		} else {
+			verified = verifyProtocolFilters(ctx, channel, netInterface, protocols, classRule)
+		}
+		if verified.Success {
+			return response
+		}
+		response = verified
+	}
+	if rollback := stopNet(ctx, netInterface, channel); !rollback.Success && len(protocols) > 1 {
+		return spec.ReturnFail(spec.UnexpectedStatus, fmt.Sprintf("%s (rollback on %s failed: %s)", response.Err, netInterface, rollback.Err))
 	}
 	return response
+}
+
+// Require evidence from the target namespace before reporting a list as active.
+func verifyProtocolFilters(ctx context.Context, channel spec.Channel, device string, protocols []string, classRule string) *spec.Response {
+	qdisc := channel.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !qdisc.Success {
+		return qdisc
+	}
+	out, _ := qdisc.Result.(string)
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "qdisc netem 40: parent 1:4 ") {
+			found = true
+			for _, attr := range netemKeywords(classRule) {
+				if !slices.Contains(strings.Fields(line), attr) {
+					return spec.ReturnFail(spec.UnexpectedStatus, "missing netem attribute: "+attr)
+				}
+			}
+			break
+		}
+	}
+	if !found {
+		return spec.ReturnFail(spec.UnexpectedStatus, "missing experiment netem qdisc on "+device)
+	}
+	filters := channel.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref 4", device))
+	if !filters.Success {
+		return filters
+	}
+	out, _ = filters.Result.(string)
+	selected := make(map[string]bool)
+	inTarget := false
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "filter" {
+			inTarget = strings.Contains(" "+strings.Join(fields, " ")+" ", " flowid 1:4 ")
+		} else if inTarget && len(fields) == 4 && fields[0] == "match" && fields[2] == "at" && fields[3] == "8" {
+			selected[fields[1]] = true
+		}
+	}
+	for _, p := range protocols {
+		n, err := strconv.Atoi(p)
+		if err != nil || !selected[fmt.Sprintf("%08x/00ff0000", n<<16)] {
+			return spec.ReturnFail(spec.UnexpectedStatus, "missing protocol filter on "+device+": "+p)
+		}
+	}
+	return spec.ReturnSuccess(nil)
 }
 
 func buildTargetFilterPortAndIp(localPortRanges, remotePortRanges [][]int, destIpRules []string, excludePortRanges [][]int,
@@ -542,6 +660,182 @@ func buildTargetFilterPortAndIp(localPortRanges, remotePortRanges [][]int, destI
 func addQdiscForDL(channel spec.Channel, ctx context.Context, netInterface string) *spec.Response {
 	// add tc filter for delay specify port
 	return channel.Run(ctx, tcCommand(), fmt.Sprintf(`qdisc add dev %s root handle 1: prio bands 4`, netInterface))
+}
+
+const (
+	ownerMarkerPriority = 32000
+	ownerMarkerTable    = "7aa:"
+)
+
+// The table is not linked from any classifier. Its keys identify the owner
+// without selecting or redirecting packets. The kernel removes it with the root.
+func ownerKeys(uid string) []string {
+	sum := sha256.Sum256([]byte(uid))
+	keys := make([]string, 4)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("%x", sum[i*4:i*4+4])
+	}
+	return keys
+}
+
+func installOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
+	base := fmt.Sprintf("filter add dev %s parent 1: protocol ip pref %d", device, ownerMarkerPriority)
+	args := fmt.Sprintf("%s handle %s u32 divisor 1 && tc %s u32 ht %s", base, ownerMarkerTable, base, ownerMarkerTable)
+	for i, key := range ownerKeys(uid) {
+		args += fmt.Sprintf(" match u32 0x%s 0xffffffff at %d", key, 4*i)
+	}
+	if resp := cl.Run(ctx, tcCommand(), args); !resp.Success {
+		return resp
+	}
+	return checkOwnerMarker(ctx, cl, device, uid)
+}
+
+func hasOwnerMarker(output, uid string) bool {
+	want := ownerKeys(uid)
+	matched := 0
+	inMarker := false
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "filter" {
+			inMarker = false
+			matched = 0
+			for i, field := range fields {
+				if field == "fh" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], ownerMarkerTable+":") {
+					inMarker = true
+				}
+			}
+		} else if inMarker && strings.Join(fields, " ") == fmt.Sprintf("match %s/ffffffff at %d", want[matched], 4*matched) {
+			matched++
+			if matched == len(want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rootQdisc returns the kind and handle of the egress root in tc output.
+func rootQdisc(output string) (string, string) {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[0] == "qdisc" && fields[3] == "root" {
+			return fields[1], fields[2]
+		}
+	}
+	return "", ""
+}
+
+func checkRootBeforeCreate(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
+	q := cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !q.Success {
+		return q
+	}
+	output, ok := q.Result.(string)
+	if !ok {
+		return spec.ReturnFail(spec.UnexpectedStatus, "cannot read root qdisc on "+device)
+	}
+	kind, handle := rootQdisc(output)
+	if handle == "" || handle == "0:" {
+		// The exclusive qdisc add is still required after the preflight.
+		return spec.ReturnSuccess(nil)
+	}
+	resp := spec.ReturnFail(spec.UnexpectedStatus, "root qdisc already in use on "+device)
+	if kind == "prio" && handle == "1:" {
+		// A repeated create with the same UID may find its own live fault.
+		// In that case the caller must retain the target for recovery.
+		filters := readOwnerFilters(ctx, cl, device)
+		output, ok := filters.Result.(string)
+		if !filters.Success || !ok || hasOwnerMarker(output, uid) {
+			return resp
+		}
+	}
+	// Only a create rejected before mutation supplies this per-dispatch receipt.
+	resp.Result = map[string]string{"networkCreateSkippedUID": uid}
+	return resp
+}
+
+func stopNetworkExperiment(ctx context.Context, device, uid, protocol string, cl spec.Channel) *spec.Response {
+	protocols, err := protocolNumbers(protocol)
+	if err != nil {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, err.Error())
+	}
+	guard, lockErr := lockNetns(ctx)
+	if lockErr != nil {
+		return spec.ReturnFail(spec.UnexpectedStatus, lockErr.Error())
+	}
+	defer guard.Close()
+	if len(protocols) == 1 {
+		if guard := checkLegacyNetworkRoot(ctx, cl, device); !guard.Success {
+			return guard
+		}
+		return stopNet(ctx, device, cl)
+	}
+	qdisc := cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !qdisc.Success {
+		return qdisc
+	}
+	output, _ := qdisc.Result.(string)
+	kind, handle := rootQdisc(output)
+	if handle == "0:" {
+		return spec.ReturnSuccess("experiment root is absent")
+	}
+	if handle != "" && (handle != "1:" || kind != "prio") {
+		// A legacy checkpoint may predate create receipts. This root cannot
+		// contain our experiment. Leave it untouched and identify the UID
+		// for which the operator can confirm absence.
+		resp := spec.ReturnFail(spec.UnexpectedStatus, "refusing to delete a foreign root qdisc on "+device)
+		resp.Result = map[string]string{"networkRootAbsentUID": uid}
+		return resp
+	}
+	if verified := checkOwnerMarker(ctx, cl, device, uid); !verified.Success {
+		return verified
+	}
+	return cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc del dev %s root handle 1:", device))
+}
+
+// Protect a marked experiment from a legacy single-protocol destroy or --force.
+func checkLegacyNetworkRoot(ctx context.Context, cl spec.Channel, device string) *spec.Response {
+	q := cl.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !q.Success {
+		return q
+	}
+	out, ok := q.Result.(string)
+	if !ok {
+		return spec.ReturnFail(spec.UnexpectedStatus, "cannot read root qdisc on "+device)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "qdisc prio 1: root ") {
+			continue
+		}
+		f := readOwnerFilters(ctx, cl, device)
+		if !f.Success {
+			return f
+		}
+		filters, ok := f.Result.(string)
+		if !ok || strings.Contains(filters, "fh "+ownerMarkerTable) {
+			return spec.ReturnFail(spec.UnexpectedStatus, "refusing to remove a reserved network root on "+device)
+		}
+	}
+	return spec.ReturnSuccess(nil)
+}
+
+func readOwnerFilters(ctx context.Context, cl spec.Channel, device string) *spec.Response {
+	return cl.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref %d", device, ownerMarkerPriority))
+}
+
+func checkOwnerMarker(ctx context.Context, cl spec.Channel, device, uid string) *spec.Response {
+	filters := readOwnerFilters(ctx, cl, device)
+	if !filters.Success {
+		return filters
+	}
+	output, _ := filters.Result.(string)
+	if !hasOwnerMarker(output, uid) {
+		return spec.ReturnFail(spec.UnexpectedStatus, "cannot confirm ownership of the root qdisc on "+device)
+	}
+	return spec.ReturnSuccess(nil)
 }
 
 // stopNet

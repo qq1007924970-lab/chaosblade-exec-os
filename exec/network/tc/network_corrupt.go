@@ -114,11 +114,11 @@ func (ce *NetworkCorruptExecutor) start(netInterface, localPort, remotePort, exc
 ) *spec.Response {
 	classRule := fmt.Sprintf("netem corrupt %s%%", percent)
 
-	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, protocol, ce.channel)
+	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, "", protocol, ce.channel)
 }
 
 func (ce *NetworkCorruptExecutor) stop(netInterface string, ctx context.Context) *spec.Response {
-	return stopNet(ctx, netInterface, ce.channel)
+	return stopNetworkExperiment(ctx, netInterface, "", "", ce.channel)
 }
 
 func (ce *NetworkCorruptExecutor) SetChannel(channel spec.Channel) {

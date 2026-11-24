@@ -102,7 +102,7 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *spe
 		dev = netInterface
 	}
 	if _, ok := spec.IsDestroy(ctx); ok {
-		return nle.stop(dev, ctx)
+		return stopNetworkExperiment(ctx, dev, uid, model.ActionFlags["protocol"], nle.channel)
 	}
 	percent := model.ActionFlags["percent"]
 	if percent == "" {
@@ -117,18 +117,14 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *spe
 	ignorePeerPort := model.ActionFlags["ignore-peer-port"] == "true"
 	protocol := model.ActionFlags["protocol"]
 	force := model.ActionFlags["force"] == "true"
-	return nle.start(dev, localPort, remotePort, excludePort, destIp, excludeIp, percent, ignorePeerPort, force, protocol, ctx)
+	return nle.start(dev, localPort, remotePort, excludePort, destIp, excludeIp, percent, ignorePeerPort, force, uid, protocol, ctx)
 }
 
 func (nle *NetworkLossExecutor) start(netInterface, localPort, remotePort, excludePort, destIp, excludeIp, percent string,
-	ignorePeerPort, force bool, protocol string, ctx context.Context,
+	ignorePeerPort, force bool, uid, protocol string, ctx context.Context,
 ) *spec.Response {
 	classRule := fmt.Sprintf("netem loss %s%%", percent)
-	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, protocol, nle.channel)
-}
-
-func (nle *NetworkLossExecutor) stop(netInterface string, ctx context.Context) *spec.Response {
-	return stopNet(ctx, netInterface, nle.channel)
+	return startNet(ctx, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp, force, ignorePeerPort, uid, protocol, nle.channel)
 }
 
 func (nle *NetworkLossExecutor) SetChannel(channel spec.Channel) {
