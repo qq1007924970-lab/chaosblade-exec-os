@@ -24,6 +24,7 @@ import (
 	"math/bits"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -193,7 +194,7 @@ var commFlags = []spec.ExpFlagSpec{
 	},
 	&spec.ExpFlag{
 		Name: "protocol",
-		Desc: "specify protocol for example tcp udp icmp ",
+		Desc: "Match tcp, udp or icmp; separate multiple protocols with commas (e.g. tcp,udp).",
 	},
 	&spec.ExpFlag{
 		Name:   "force",
@@ -204,21 +205,37 @@ var commFlags = []spec.ExpFlagSpec{
 
 const delimiter = ","
 
-func startNet(ctx context.Context, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp string, force, ignorePeerPorts bool, protocol string, cl spec.Channel) *spec.Response {
-	if protocol != "" {
-		switch protocol {
-		case "tcp":
-			protocol = "6"
-		case "udp":
-			protocol = "17"
-		case "icmp":
-			protocol = "1"
-		default:
-			return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, "unsupport protocol")
+// An empty flag retains the original unrestricted protocol match.
+func protocolNumbers(value string) ([]string, error) {
+	if value == "" {
+		return []string{""}, nil
+	}
+	ids := map[string]string{"tcp": "6", "udp": "17", "icmp": "1"}
+	seen := make(map[string]bool)
+	var protocols []string
+	for _, item := range strings.Split(value, ",") {
+		id, ok := ids[strings.TrimSpace(item)]
+		if !ok {
+			return nil, fmt.Errorf("unknown network protocol %q", item)
+		}
+		if !seen[id] {
+			seen[id] = true
+			protocols = append(protocols, id)
 		}
 	}
+	return protocols, nil
+}
+
+func startNet(ctx context.Context, netInterface, classRule, localPort, remotePort, excludePort, destIp, excludeIp string, force, ignorePeerPorts bool, protocol string, cl spec.Channel) *spec.Response {
+	protocols, err := protocolNumbers(protocol)
+	if err != nil {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, err.Error())
+	}
+	multi := len(protocols) > 1
+	if multi && slices.Contains(protocols, "1") && (localPort != "" || remotePort != "" || excludePort != "") {
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "protocol", protocol, "ICMP in a protocol list cannot be combined with port filters")
+	}
 	var localPortRanges, remotePortRanges, excludePortRanges [][]int
-	var err error
 	if localPort != "" {
 		localPortRanges, err = parseIntegerListToPortRanges("local-port", localPort)
 		if err != nil {
@@ -252,7 +269,8 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 			excludeIp = channelIps
 		}
 	}
-	if force {
+	// A multi-protocol experiment must acquire its own root, even with --force.
+	if force && !multi {
 		stopNet(ctx, netInterface, cl)
 	}
 	// Only interface flag
@@ -269,6 +287,9 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	}
 
 	response = addQdiscForDL(cl, ctx, netInterface)
+	if multi && !response.Success {
+		return response
+	}
 
 	// only contains excludePort or excludeIP
 	if localPort == "" && remotePort == "" && destIp == "" && protocol == "" {
@@ -290,7 +311,7 @@ func startNet(ctx context.Context, netInterface, classRule, localPort, remotePor
 	excludeIpRules := getExcludeIpRules(excludeIp)
 	// local port or remote port
 	return executeTargetPortAndIpWithExclude(ctx, cl, netInterface, classRule, localPortRanges, remotePortRanges, destIpRules,
-		excludePortRanges, excludeIpRules, protocol)
+		excludePortRanges, excludeIpRules, protocols)
 }
 
 func getExcludePortRanges(ctx context.Context, excludePort string, ignorePeerPorts bool, cl spec.Channel) ([][]int, error) {
@@ -432,20 +453,84 @@ func getExcludeIpRules(excludeIp string) []string {
 
 // executeTargetPortAndIpWithExclude creates class rule in 1:4 queue and add filter to the queue
 func executeTargetPortAndIpWithExclude(ctx context.Context, channel spec.Channel,
-	netInterface, classRule string, localPortRanges, remotePortRanges [][]int, destIpRules []string, excludePorts [][]int, excludeIpRules []string, protocol string,
+	netInterface, classRule string, localPortRanges, remotePortRanges [][]int, destIpRules []string, excludePorts [][]int, excludeIpRules []string, protocols []string,
 ) *spec.Response {
 	args := fmt.Sprintf(`qdisc add dev %s parent 1:4 handle 40: %s`, netInterface, classRule)
-	args = buildTargetFilterPortAndIp(localPortRanges, remotePortRanges, destIpRules, excludePorts, excludeIpRules, args, netInterface, protocol)
-	response := channel.Run(ctx, tcCommand(), args)
-	if !response.Success {
-		stopNet(ctx, netInterface, channel)
-		return response
+	for _, protocol := range protocols {
+		// For exclusion-only selection, first match the protocol on all IPv4
+		// destinations. Higher-priority exclusions still bypass netem.
+		targets := destIpRules
+		if len(protocols) > 1 && len(destIpRules) == 0 && len(localPortRanges) == 0 && len(remotePortRanges) == 0 && (len(excludeIpRules) > 0 || len(excludePorts) > 0) {
+			targets = []string{"match ip dst 0.0.0.0/0"}
+		}
+		args = buildTargetFilterPortAndIp(localPortRanges, remotePortRanges, targets, excludePorts, excludeIpRules, args, netInterface, protocol)
 	}
-	if verifyResp := verifyNetemApplied(ctx, channel, netInterface, classRule); !verifyResp.Success {
-		stopNet(ctx, netInterface, channel)
-		return verifyResp
+	response := channel.Run(ctx, tcCommand(), args)
+	if response.Success {
+		var verified *spec.Response
+		if len(protocols) == 1 {
+			verified = verifyNetemApplied(ctx, channel, netInterface, classRule)
+		} else {
+			verified = verifyProtocolFilters(ctx, channel, netInterface, protocols, classRule)
+		}
+		if verified.Success {
+			return response
+		}
+		response = verified
+	}
+	if rollback := stopNet(ctx, netInterface, channel); !rollback.Success && len(protocols) > 1 {
+		return spec.ReturnFail(spec.UnexpectedStatus, fmt.Sprintf("%s (rollback on %s failed: %s)", response.Err, netInterface, rollback.Err))
 	}
 	return response
+}
+
+// Require evidence from the target namespace before reporting a list as active.
+func verifyProtocolFilters(ctx context.Context, channel spec.Channel, device string, protocols []string, classRule string) *spec.Response {
+	qdisc := channel.Run(ctx, tcCommand(), fmt.Sprintf("qdisc show dev %s", device))
+	if !qdisc.Success {
+		return qdisc
+	}
+	out, _ := qdisc.Result.(string)
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "qdisc netem 40: parent 1:4 ") {
+			found = true
+			for _, attr := range netemKeywords(classRule) {
+				if !slices.Contains(strings.Fields(line), attr) {
+					return spec.ReturnFail(spec.UnexpectedStatus, "missing netem attribute: "+attr)
+				}
+			}
+			break
+		}
+	}
+	if !found {
+		return spec.ReturnFail(spec.UnexpectedStatus, "missing experiment netem qdisc on "+device)
+	}
+	filters := channel.Run(ctx, tcCommand(), fmt.Sprintf("filter show dev %s parent 1: pref 4", device))
+	if !filters.Success {
+		return filters
+	}
+	out, _ = filters.Result.(string)
+	selected := make(map[string]bool)
+	inTarget := false
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "filter" {
+			inTarget = strings.Contains(" "+strings.Join(fields, " ")+" ", " flowid 1:4 ")
+		} else if inTarget && len(fields) == 4 && fields[0] == "match" && fields[2] == "at" && fields[3] == "8" {
+			selected[fields[1]] = true
+		}
+	}
+	for _, p := range protocols {
+		n, err := strconv.Atoi(p)
+		if err != nil || !selected[fmt.Sprintf("%08x/00ff0000", n<<16)] {
+			return spec.ReturnFail(spec.UnexpectedStatus, "missing protocol filter on "+device+": "+p)
+		}
+	}
+	return spec.ReturnSuccess(nil)
 }
 
 func buildTargetFilterPortAndIp(localPortRanges, remotePortRanges [][]int, destIpRules []string, excludePortRanges [][]int,
